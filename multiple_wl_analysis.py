@@ -12,8 +12,8 @@ os.chdir('C:/Users/obriene/Projects/Wait Lists/Multiple Wait List Analysis/Outpu
 #Select group to filter the data on
 #group = 'LD and ASD'
 #group = 'LD'
-group = 'ASD'
-#group = 'All'
+#group = 'ASD'
+group = 'All'
 
 #Settings dict contains the filter strings to filter the data to different
 #groups, and a the number of how many pairs to keep for the
@@ -178,6 +178,8 @@ ls_cols = [col for col in wait_list.columns if 'ls' in col]
 #Reformat so that each patients has multiple rows, one for each WL
 wl_longform = pd.melt(wait_list[['pasid'] + wl_cols], id_vars='pasid',
                       value_name='WL')[['pasid', 'WL']].dropna()
+#Get a df with a list of WL for each patient
+wl_list = wl_longform.groupby('pasid')['WL'].agg(list)
 #reformat to crosstab table
 wl_crosstab = pd.crosstab(wl_longform['pasid'], wl_longform['WL'])
 wl_crosstab = wl_crosstab.where(wl_crosstab < 1, 1)
@@ -188,6 +190,8 @@ ls_longform = pd.melt(wait_list[['pasid'] + ls_cols], id_vars='pasid',
 ls_longform['local_spec'] = ls_longform['local_spec'].str.strip()
 #join on local spec names
 ls_longform = ls_longform.merge(local_spec, on='local_spec', how='left')
+#Get a df with a list of WL for each patient
+ls_list = ls_longform.groupby('pasid')['local_spec_desc'].agg(list)
 #reformat to crosstab table
 ls_crosstab = pd.crosstab(ls_longform['pasid'], ls_longform['local_spec_desc'])
 ls_crosstab = ls_crosstab.where(ls_crosstab < 1, 1)
@@ -196,13 +200,11 @@ ls_crosstab = ls_crosstab.where(ls_crosstab < 1, 1)
 # # Heatmaps
 # =============================================================================
 #Grouping up wait list
-cats_wl = (wl_longform.groupby('pasid')['WL'].agg(list)
-        .apply(lambda x:list(combinations(set(x),2)))
-        .explode().value_counts().reset_index()
-        .rename(columns={'index':'Waiting List 1'}))
+cats_wl = (wl_list.apply(lambda x:list(combinations(set(x),2)))
+           .explode().value_counts().reset_index()
+           .rename(columns={'index':'Waiting List 1'}))
 #group up local specs
-cats_ls = (ls_longform.groupby('pasid')['local_spec_desc'].agg(list)
-           .apply(lambda x:list(combinations(set(x),2)))
+cats_ls = (ls_list.apply(lambda x:list(combinations(set(x),2)))
            .explode().value_counts().reset_index()
            .rename(columns={'index':'Local Spec 1'}))
 
@@ -248,28 +250,27 @@ def patient_counts(itemsets, patients):
     for itemset in itemsets:
         count = 0
         for patient in patients:
-            if all(i in itemset for i in patient):
+            if all(i in patient for i in itemset):
                 count += 1
         no_patients.append(count)
     return no_patients
 
 #Apply Apriori algorithm to wl data
-def implement_apriori(crosstab, longform, data):
-    frequent_itemsets = apriori(crosstab.astype(bool), min_support=0.001, use_colnames=True)
+def implement_apriori(crosstab, pat_list, data):
+    frequent_itemsets = apriori(crosstab.astype(bool), min_support=0.001,
+                                use_colnames=True)
     rules = association_rules(frequent_itemsets, metric="lift", min_threshold=1)
     #remove frozensets
-    frequent_itemsets['itemsets'] = [list(lst) for lst in frequent_itemsets['itemsets']]
+    frequent_itemsets['itemsets'] = [list(lst) for lst
+                                     in frequent_itemsets['itemsets']]
     rules['antecedents'] = [next(iter(lst)) for lst in rules['antecedents']]
     rules['consequents'] = [next(iter(lst)) for lst in rules['consequents']]
-    #get lists of all the wait list an individual patient is on
-    patients = longform.groupby('pasid').agg(list)
-    patients = patients.rename(columns={patients.columns[-1]:'Patient WL'})
     #Get the number of patients with each itemset in their list of waitlists
     frequent_itemsets['No. Patients'] = patient_counts(
-        frequent_itemsets['itemsets'], patients['Patient WL'])
-    rules['No. Patients'] = patient_counts(
-        rules[['antecedents', 'consequents']].apply(list, axis=1).tolist(),
-        patients['Patient WL'])
+        frequent_itemsets['itemsets'], pat_list)
+    rules['No. Patients'] = patient_counts(rules[['antecedents', 'consequents']]
+                                           .apply(list, axis=1).tolist(),
+                                           pat_list)
     #Format and save frequent itemsets
     frequent_itemsets = frequent_itemsets.sort_values(by='support',
                                                       ascending=False)
@@ -283,5 +284,5 @@ def implement_apriori(crosstab, longform, data):
     rules.to_excel(f'{group} {data} Apriori Association Rules.xlsx',
                    index=False)
 
-implement_apriori(wl_crosstab, wl_longform, 'Wait List')
-implement_apriori(ls_crosstab, ls_longform, 'Local Spec')
+implement_apriori(wl_crosstab, wl_list, 'Wait List')
+implement_apriori(ls_crosstab, ls_list, 'Local Spec')
