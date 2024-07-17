@@ -18,10 +18,11 @@ group = 'All'
 #Settings dict contains the filter strings to filter the data to different
 #groups, and a the number of how many pairs to keep for the
 #heat mapping (to ensure heatmaps aren't too complicated to read).
-settings = {'LD and ASD':[['LD', 'ASD'], 10],
+settings = {'All':[[], 150],
+            'No LD or ASD':[['LD', 'ASD'], np.nan],#only used for summary table
+            'LD and ASD':[['LD', 'ASD'], 10],
             'LD':[['LD'], 5],
-            'ASD':[['ASD'], 3],
-            'All':[[], 150]}
+            'ASD':[['ASD'], 3]}
 
 #Check the inputted group is valid
 try:
@@ -158,23 +159,73 @@ local_spec = pd.read_sql(local_spec_query,sdmart_engine)
 #dispose connection
 sdmart_engine.dispose()
 
+#Create list of wl and ls columns to simplifty other code
+wl_cols = [col for col in wait_list.columns if 'wl' in col]
+ls_cols = [col for col in wait_list.columns if 'ls' in col]
+
+def filter_data(filters, df):
+    if len(filters) == 1:
+        df = df.loc[df[filters[0]] == filters[0]].copy()
+    elif len(filters) == 2:
+        df = df.loc[(df[filters[0]] == filters[0])
+                    | (df[filters[1]] == filters[1])].copy()
+    return df
+# =============================================================================
+# # Number of wait list analysis
+# =============================================================================
+wait_list['Wait Lists'] = [[i for i in row if i]
+                           for row in wait_list[wl_cols].values.tolist()]
+wait_list['Number of Wait Lists'] = wait_list['Wait Lists'].str.len()
+wait_list.groupby('Number of Wait Lists')['patnt_refno'].count()
+
+data = []
+counts = []
+summary = []
+for setting in settings.items():
+    filter = setting[1][0]
+    name = setting[0]
+    if name == 'No LD or ASD':
+        df_wait = wait_list.loc[(wait_list[filter[0]] != filter[0])
+                    & (wait_list[filter[1]] != filter[1])].copy()
+    else:
+        df_wait = filter_data(filter, wait_list)
+    count = df_wait.groupby('Number of Wait Lists')['patnt_refno'].count()
+    desc = df_wait['Number of Wait Lists'].describe()
+    count.name = name
+    desc.name = name
+    data.append(df_wait['Number of Wait Lists'].rename(name))
+    counts.append(count)
+    summary.append(desc)
+
+data_df = pd.DataFrame(data).transpose()
+summary_df = pd.DataFrame(summary)
+counts_df = pd.DataFrame(counts).transpose()
+proportion_df = counts_df/summary_df['count']
+counts_df.columns = [col + ' Count' for col in counts_df.columns]
+proportion_df.columns = [col + ' Proportion' for col in proportion_df.columns]
+counts_df = counts_df.join(proportion_df)
+
+writer = pd.ExcelWriter('No. Wait List Summary.xlsx',engine='xlsxwriter')   
+workbook=writer.book
+worksheet=workbook.add_worksheet('Summary')
+writer.sheets['Summary'] = worksheet
+counts_df.to_excel(writer, sheet_name='Summary', startrow=0 , startcol=0)   
+summary_df.to_excel(writer, sheet_name='Summary', startrow=16, startcol=0)
+writer.close()
+
+
+# =============================================================================
+# # Filter Data
+# =============================================================================
 #If only looking at LD/ASD patients, remove records with no LD/ASD here based
 #on the filters lists
-if len(filters) == 1:
-    wait_list = wait_list.loc[wait_list[filters[0]] == filters[0]].copy()
-elif len(filters) == 2:
-    wait_list = wait_list.loc[(wait_list[filters[0]] == filters[0])
-                 | (wait_list[filters[1]] == filters[1])]
+wait_list = filter_data(filters, wait_list)
 #remove empty columns (in case no one is on 14 wait lists)
 wait_list = wait_list.dropna(how='all', axis=1)
 
 # =============================================================================
 # # Format Data
 # =============================================================================
-#Create list of wl and ls columns to simplifty other code
-wl_cols = [col for col in wait_list.columns if 'wl' in col]
-ls_cols = [col for col in wait_list.columns if 'ls' in col]
-
 #Reformat so that each patients has multiple rows, one for each WL
 wl_longform = pd.melt(wait_list[['pasid'] + wl_cols], id_vars='pasid',
                       value_name='WL')[['pasid', 'WL']].dropna()
