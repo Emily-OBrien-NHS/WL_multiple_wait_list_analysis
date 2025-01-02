@@ -1,4 +1,5 @@
 import os
+import datetime
 import numpy as np
 import pandas as pd
 import seaborn as sns
@@ -8,12 +9,14 @@ from mlxtend.frequent_patterns import apriori
 from mlxtend.frequent_patterns import association_rules
 from itertools import combinations, combinations_with_replacement
 os.chdir('C:/Users/obriene/Projects/Wait Lists/Multiple Wait List Analysis/Outputs')
-
+run_date = datetime.datetime.today().strftime('%Y-%m-%d')
 #Select group to filter the data on
 #group = 'LD and ASD'
 #group = 'LD'
 #group = 'ASD'
-group = 'All'
+#group = 'Age 65+'
+group = 'CFS 5+'
+#group = 'All'
 
 #Settings dict contains the filter strings to filter the data to different
 #groups, and a the number of how many pairs to keep for the
@@ -22,6 +25,8 @@ settings = {'All':[[], 150],
             'No LD or ASD':[['LD', 'ASD'], np.nan],#only used for summary table
             'LD and ASD':[['LD', 'ASD'], 10],
             'LD':[['LD'], 5],
+            'Age 65+':[['Age 65+'], 75],
+            'CFS 5+' :[['CFS 5+'], 10],
             'ASD':[['ASD'], 3]}
 
 #Check the inputted group is valid
@@ -42,11 +47,11 @@ sdmart_engine = create_engine('mssql+pyodbc://@SDMartDataLive2/InfoDB?'\
                                '+for+SQL+Server')
 #wait list query
 wl_query = """SET NOCOUNT ON
-SELECT DISTINCT wl.patnt_refno, wl.pasid, wl.pat_pcode, wl.list_name,
-                CASE WHEN wl.list_name LIKE '%plan%' THEN 'New OP Planned WL' ELSE 'New OP WL' END AS WL_Group,
-                wl.wlist_refno, wl.refrl_refno, wl.pat_dob, wl.calculateAge AS Age,
-                wl.local_spec, wl.local_cons_code, wl.proca_refno, wl.wlist_dttm,
-                wl.prityp, wl.run_date, pat.registered_practice AS PracticeCode
+--------------------------------WAIT LIST
+----union wait list and follow up data
+SELECT DISTINCT wl.patnt_refno, wl.pasid, wl.list_name,
+                wl.wlist_refno, wl.calculateAge AS Age,
+                wl.local_spec
 INTO #OP_WL
 FROM vw_wlist_op  wl
 LEFT JOIN Pimsmarts.dbo.patients pat
@@ -56,11 +61,8 @@ and wl.list_name NOT LIKE '%(FU)%'
 and wl.wlist_refno IS NOT NULL --non wl entries
 
 UNION ALL
-SELECT DISTINCT fu.patnt_refno, fu.pasid,fu.pat_pcode, fu.list_name,
-                WL_Group = 'Follow Up WL', fu.wlist_refno, fu.refrl_refno,
-                fu.pat_dob, fu.calculateAge AS Age, fu.local_spec,
-                fu.local_cons_code, fu.proca_refno, fu.wlist_dttm, fu.prityp,
-                fu.run_date, pat.registered_practice AS PracticeCode
+SELECT DISTINCT fu.patnt_refno, fu.pasid, fu.list_name,
+                fu.wlist_refno, fu.calculateAge AS Age, fu.local_spec
 FROM [dbo].[vw_wlist_op_fu] fu
 
 LEFT JOIN Pimsmarts.dbo.patients pat ON fu.patnt_refno = pat.patnt_refno
@@ -68,16 +70,54 @@ WHERE fu.pfmgt_spec NOT IN ('ZZ','ZN')
 and fu.list_name LIKE '%(FU)%'
 and fu.wlist_refno IS NOT NULL
 
-----SELECT * FROM #op_wl
+--------------------------------FRAILTY
+----First get all inpatient records with CFS recorded
+SELECT patnt.HospitalNumber, [HistModifiedDateTime],
+	   substring(AttributeStatusDesc,31,1) as CFS ---Get the number of the CFS score and not the text
+INTO #temp_frailty
+FROM [DWRealtime].[RealTimeReporting].[PCM].[vw_AttributeValueHistory] attval ----Historical values of SALUS attributes
+LEFT JOIN [DWRealtime].AsclepeionReplica.PASData.Patient Patnt with (nolock) ----Patient demographic data
+ON Patnt.PKPatientId = attval.AsclepeionPatientId
+WHERE AttributeCode = 'F' ----Only want to see frailty attributes
+AND AttributeStatusDesc <> 'Previously Frail (Carry Out Reassessment of CFS)' ---Don't include need for reassessment
 
-----Then using JW's query (altered to use all opwl data)
+UNION ALL
+
+----Then get all ED attendances with CFS recorded
+SELECT HospitalNumber, ArrivalDateTime,
+	   substring(ClinicalFrailtyScore,30,1)---Get the number of the CFS score and not the text
+FROM [cl3-data].DataWarehouse.ed.vw_EDattendance
+WHERE ClinicalFrailtyScore IS NOT NULL ---Only want attendances with a CFS recorded
+AND arrivalDateTime > '01-JUN-2022' ---records since Nervecentre was implemented
+
+----Find the most recent version for each patient
+SELECT HospitalNumber, max([HistModifiedDateTime]) AS MostRecentVersion
+INTO #frailty_mr
+FROM #temp_frailty
+GROUP BY HospitalNumber
+
+----Get the hospital number, patnt_refno and most recent CFS
+SELECT temp.HospitalNumber, pat.patnt_refno, CFS
+INTO #frailty
+FROM #temp_frailty temp
+---inner join to the most recent record, on both the patient detail and the most recent timestamp
+INNER JOIN #frailty_mr mr ON mr.HospitalNumber = temp.HospitalNumber
+							AND mr.MostRecentVersion = temp.[HistModifiedDateTime]
+---Join to the patients table to get the patnt_refno
+LEFT JOIN PiMSMarts.dbo.patients pat on pat.pasid = mr.HospitalNumber
+
+
+--------------------------------TEMP TABLE
+----Select the data, add row number for each wait list and local spec.
 SET NOCOUNT ON
-SELECT pasid, list_name, local_spec,
+SELECT pasid, list_name, local_spec, Age,
        indx = ROW_NUMBER () over (partition by pasid order by pasid,list_name)
-INTO #temp --SELECT * FROM #temp
+INTO #temp
 FROM #OP_WL
 
-SELECT list1.pasid, pat.patnt_refno,
+--------------------------------SELECT STATEMENT
+----Final select statement with joins to make pivot table.
+SELECT list1.pasid, pat.patnt_refno, list1.Age, frail.CFS,
        LD = CASE WHEN alertLD.PATNT_REFNO IS NOT NULL THEN 'LD' ELSE 'No LD Recorded' END,
        ASD = CASE WHEN alertASD.PATNT_REFNO IS NOT NULL THEN 'ASD' ELSE 'No ASD Recorded' END,
        wl0 = list1.list_name, wl1 = list2.list_name, wl2 = list3.list_name,
@@ -148,6 +188,8 @@ LEFT JOIN (SELECT DISTINCT patnt_refno
            FROM PiMSMarts.dbo.Patient_Alert_Mart 
            WHERE ODPCD_CODE = 'COM15' 
            and END_DTTM IS NULL) alertASD ON pat.patnt_refno=alertASD.PATNT_REFNO
+
+LEFT JOIN #frailty frail ON pat.patnt_refno = frail.patnt_refno
 WHERE list1.indx = 1
 """
 #local spec names query
@@ -162,6 +204,10 @@ sdmart_engine.dispose()
 #Create list of wl and ls columns to simplifty other code
 wl_cols = [col for col in wait_list.columns if 'wl' in col]
 ls_cols = [col for col in wait_list.columns if 'ls' in col]
+
+#If looking at age 65+ or CFS 5+ add in these columns
+wait_list['Age 65+'] = np.where(wait_list['Age'] >= 65, 'Age 65+', '')
+wait_list['CFS 5+'] = np.where(wait_list['CFS'].astype(float) >= 5, 'CFS 5+', '')
 
 def filter_data(filters, df):
     if len(filters) == 1:
@@ -205,7 +251,7 @@ counts_df.columns = [col + ' Count' for col in counts_df.columns]
 proportion_df.columns = [col + ' Proportion' for col in proportion_df.columns]
 counts_df = counts_df.join(proportion_df)
 
-writer = pd.ExcelWriter('No. Wait List Summary.xlsx',engine='xlsxwriter')   
+writer = pd.ExcelWriter(f'No. Wait List Summary {run_date}.xlsx',engine='xlsxwriter')   
 workbook=writer.book
 worksheet=workbook.add_worksheet('Summary')
 writer.sheets['Summary'] = worksheet
@@ -259,6 +305,11 @@ cats_ls = (ls_list.apply(lambda x:list(combinations(set(x),2)))
            .explode().value_counts().reset_index()
            .rename(columns={'index':'Local Spec 1'}))
 
+longform = wl_longform.copy()
+cat_df = cats_wl.copy()
+colname = 'WL'
+data = 'Local Spec'
+keep_lim = 75
 #Heatmap function
 def heatmap(longform, cat_df, colname, data, keep_lim):
     #Create a df of all possible combinations
@@ -283,11 +334,12 @@ def heatmap(longform, cat_df, colname, data, keep_lim):
     pivot_ls = pivot_ls.loc[keep_rows, keep_cols]
     #plot heatmap
     fig, ax = plt.subplots(figsize=(20, 10))
+    labels = pivot_ls.map(lambda v: v if v else '')
     sns.heatmap(pivot_ls, cmap='Blues', robust=True, annot=True, fmt='g',
                 linewidths=0.5, linecolor='k', ax=ax)
     ax.set(xlabel=f'{data} 1', ylabel=f'{data} 2')
     plt.title(f'Occurances of {data} Pairs')
-    plt.savefig(f'{group} {data} Heatmap.png', bbox_inches='tight')
+    plt.savefig(f'{group}/{group} {data} Heatmap {run_date}.png', bbox_inches='tight')
     plt.close()
 
 heatmap(ls_longform, cats_ls, 'local_spec_desc', 'Local Spec', pairs_to_keep)
@@ -310,7 +362,8 @@ def patient_counts(itemsets, patients):
 def implement_apriori(crosstab, pat_list, data):
     frequent_itemsets = apriori(crosstab.astype(bool), min_support=0.001,
                                 use_colnames=True)
-    rules = association_rules(frequent_itemsets, metric="lift", min_threshold=1)
+    rules = association_rules(frequent_itemsets, metric="lift", min_threshold=1,
+                              num_itemsets=len(crosstab))
     #remove frozensets
     frequent_itemsets['itemsets'] = [list(lst) for lst
                                      in frequent_itemsets['itemsets']]
@@ -327,12 +380,12 @@ def implement_apriori(crosstab, pat_list, data):
                                                       ascending=False)
     frequent_itemsets['len'] = frequent_itemsets['itemsets'].apply(lambda x: len(x))
     frequent_itemsets = frequent_itemsets.loc[frequent_itemsets['len'] > 1]
-    frequent_itemsets.to_excel(f'{group} {data} Apriori Frequent Itemsets.xlsx',
+    frequent_itemsets.to_excel(f'{group}/{group} {data} Apriori Frequent Itemsets{run_date}.xlsx',
                                index=False)
     #Format and save association rules
     rules = rules.sort_values(["support", "confidence","lift"], axis=0,
                               ascending=False)
-    rules.to_excel(f'{group} {data} Apriori Association Rules.xlsx',
+    rules.to_excel(f'{group}/{group} {data} Apriori Association Rules {run_date}.xlsx',
                    index=False)
 
 implement_apriori(wl_crosstab, wl_list, 'Wait List')
