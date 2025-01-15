@@ -15,7 +15,9 @@ run_date = datetime.datetime.today().strftime('%Y-%m-%d')
 #group = 'LD'
 #group = 'ASD'
 #group = 'Age 65+'
-group = 'CFS 5+'
+#group = 'CFS 5+'
+#group = 'Paeds'
+group = 'Over 8 WL'
 #group = 'All'
 
 #Settings dict contains the filter strings to filter the data to different
@@ -25,9 +27,11 @@ settings = {'All':[[], 150],
             'No LD or ASD':[['LD', 'ASD'], np.nan],#only used for summary table
             'LD and ASD':[['LD', 'ASD'], 10],
             'LD':[['LD'], 5],
+            'ASD':[['ASD'], 3],
             'Age 65+':[['Age 65+'], 75],
             'CFS 5+' :[['CFS 5+'], 10],
-            'ASD':[['ASD'], 3]}
+            'Paeds' :[['Paeds'], 25],
+            'Over 8 WL':[['Over 8 WL'], 6]}
 
 #Check the inputted group is valid
 try:
@@ -206,8 +210,10 @@ wl_cols = [col for col in wait_list.columns if 'wl' in col]
 ls_cols = [col for col in wait_list.columns if 'ls' in col]
 
 #If looking at age 65+ or CFS 5+ add in these columns
-wait_list['Age 65+'] = np.where(wait_list['Age'] >= 65, 'Age 65+', '')
-wait_list['CFS 5+'] = np.where(wait_list['CFS'].astype(float) >= 5, 'CFS 5+', '')
+wait_list['Age 65+'] = np.where(wait_list['Age'] >= 65, 'Age 65+', 'Age <65')
+wait_list['CFS 5+'] = np.where(wait_list['CFS'].astype(float) >= 5, 'CFS 5+', 'CFS <5')
+wait_list['Paeds'] = np.where(wait_list['Age'] < 18, 'Paeds', 'Not Paeds')
+wait_list['Over 8 WL'] = np.where(wait_list[wl_cols].count(axis=1) >= 8, 'Over 8 WL', 'Under 8 WL')
 
 def filter_data(filters, df):
     if len(filters) == 1:
@@ -222,7 +228,6 @@ def filter_data(filters, df):
 wait_list['Wait Lists'] = [[i for i in row if i]
                            for row in wait_list[wl_cols].values.tolist()]
 wait_list['Number of Wait Lists'] = wait_list['Wait Lists'].str.len()
-wait_list.groupby('Number of Wait Lists')['patnt_refno'].count()
 
 data = []
 counts = []
@@ -268,6 +273,9 @@ writer.close()
 wait_list = filter_data(filters, wait_list)
 #remove empty columns (in case no one is on 14 wait lists)
 wait_list = wait_list.dropna(how='all', axis=1)
+#Redo list of wl and ls columns incase some of these have been dropped
+wl_cols = [col for col in wait_list.columns if 'wl' in col]
+ls_cols = [col for col in wait_list.columns if 'ls' in col]
 
 # =============================================================================
 # # Format Data
@@ -305,11 +313,11 @@ cats_ls = (ls_list.apply(lambda x:list(combinations(set(x),2)))
            .explode().value_counts().reset_index()
            .rename(columns={'index':'Local Spec 1'}))
 
-longform = wl_longform.copy()
-cat_df = cats_wl.copy()
-colname = 'WL'
-data = 'Local Spec'
-keep_lim = 75
+#longform = wl_longform.copy()
+#cat_df = cats_wl.copy()
+#colname = 'local_spec_desc'
+#data = 'Local Spec'
+#keep_lim = 10
 #Heatmap function
 def heatmap(longform, cat_df, colname, data, keep_lim):
     #Create a df of all possible combinations
@@ -338,7 +346,7 @@ def heatmap(longform, cat_df, colname, data, keep_lim):
     sns.heatmap(pivot_ls, cmap='Blues', robust=True, annot=True, fmt='g',
                 linewidths=0.5, linecolor='k', ax=ax)
     ax.set(xlabel=f'{data} 1', ylabel=f'{data} 2')
-    plt.title(f'Occurances of {data} Pairs')
+    plt.title(f'Occurances of {data} Pairs for {group}')
     plt.savefig(f'{group}/{group} {data} Heatmap {run_date}.png', bbox_inches='tight')
     plt.close()
 
@@ -360,9 +368,11 @@ def patient_counts(itemsets, patients):
 
 #Apply Apriori algorithm to wl data
 def implement_apriori(crosstab, pat_list, data):
-    frequent_itemsets = apriori(crosstab.astype(bool), min_support=0.001,
+    min_support = 0.001 if group != 'Over 8 WL' else 0.02
+    frequent_itemsets = apriori(crosstab.astype(bool), min_support=min_support,
                                 use_colnames=True)
-    rules = association_rules(frequent_itemsets, metric="lift", min_threshold=1,
+    rules = association_rules(frequent_itemsets, metric="lift",
+                              min_threshold=1,
                               num_itemsets=len(crosstab))
     #remove frozensets
     frequent_itemsets['itemsets'] = [list(lst) for lst
@@ -380,13 +390,14 @@ def implement_apriori(crosstab, pat_list, data):
                                                       ascending=False)
     frequent_itemsets['len'] = frequent_itemsets['itemsets'].apply(lambda x: len(x))
     frequent_itemsets = frequent_itemsets.loc[frequent_itemsets['len'] > 1]
-    frequent_itemsets.to_excel(f'{group}/{group} {data} Apriori Frequent Itemsets{run_date}.xlsx',
-                               index=False)
     #Format and save association rules
     rules = rules.sort_values(["support", "confidence","lift"], axis=0,
                               ascending=False)
-    rules.to_excel(f'{group}/{group} {data} Apriori Association Rules {run_date}.xlsx',
-                   index=False)
-
+    #Save to excel
+    writer = pd.ExcelWriter(f'{group}/{group} {data} output {run_date}.xlsx',engine='xlsxwriter')   
+    frequent_itemsets.to_excel(writer, sheet_name='Frequent Itemsets', index=False)
+    rules.to_excel(writer, sheet_name='Association Rules', index=False)
+    writer.close()
+        
 implement_apriori(wl_crosstab, wl_list, 'Wait List')
 implement_apriori(ls_crosstab, ls_list, 'Local Spec')
