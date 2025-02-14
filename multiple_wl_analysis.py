@@ -17,7 +17,8 @@ run_date = datetime.datetime.today().strftime('%Y-%m-%d')
 #group = 'Age 65+'
 #group = 'CFS 5+'
 #group = 'Paeds'
-group = 'Over 8 WL'
+#group = 'Over 8 WL'
+group = 'Multi Comorb'
 #group = 'All'
 
 #Settings dict contains the filter strings to filter the data to different
@@ -31,7 +32,8 @@ settings = {'All':[[], 150],
             'Age 65+':[['Age 65+'], 75],
             'CFS 5+' :[['CFS 5+'], 10],
             'Paeds' :[['Paeds'], 25],
-            'Over 8 WL':[['Over 8 WL'], 6]}
+            'Over 8 WL':[['Over 8 WL'], 6],
+            'Multi Comorb':[['Multi Comorb'], 75]}
 
 #Check the inputted group is valid
 try:
@@ -199,9 +201,16 @@ WHERE list1.indx = 1
 #local spec names query
 local_spec_query = """SELECT local_spec, local_spec_desc
                       FROM PiMSMarts.dbo.cset_specialties"""
+#co-morbidity patients query
+comorb_query = """SELECT Pasid as pasid, Patnt_refno as patnt_refno, COUNT(DISTINCT(Condition_Type)) AS No_Comorbs
+FROM [InfoDB].[dbo].[co_morbidities_listing]
+GROUP BY Pasid, Patnt_refno
+having COUNT(DISTINCT(Condition_Type)) >= 2  """
 #Pull back data
 wait_list = pd.read_sql(wl_query, sdmart_engine)
 local_spec = pd.read_sql(local_spec_query,sdmart_engine)
+comorb_pat = pd.read_sql(comorb_query, sdmart_engine)
+comorb_pat['Multi Comorb'] = 'Multi Comorb'
 #dispose connection
 sdmart_engine.dispose()
 
@@ -214,6 +223,7 @@ wait_list['Age 65+'] = np.where(wait_list['Age'] >= 65, 'Age 65+', 'Age <65')
 wait_list['CFS 5+'] = np.where(wait_list['CFS'].astype(float) >= 5, 'CFS 5+', 'CFS <5')
 wait_list['Paeds'] = np.where(wait_list['Age'] < 18, 'Paeds', 'Not Paeds')
 wait_list['Over 8 WL'] = np.where(wait_list[wl_cols].count(axis=1) >= 8, 'Over 8 WL', 'Under 8 WL')
+wait_list = wait_list.merge(comorb_pat[['pasid', 'Multi Comorb']], on='pasid', how='left')
 
 def filter_data(filters, df):
     if len(filters) == 1:
