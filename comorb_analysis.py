@@ -166,66 +166,99 @@ LEFT JOIN (SELECT DISTINCT patnt_refno
 LEFT JOIN #frailty frail ON pat.patnt_refno = frail.patnt_refno
 WHERE list1.indx = 1
 """
-comorb_query = """SELECT
-Pasid as pasid,
-Condition_Type as comorbidity
-FROM [InfoDB].[dbo].[co_morbidities_listing]"""
+#co-morbidity patients query
+comorb_query = """SELECT patnt_refno, pasid, [main_diag],
+[diag1], [diag2], [diag3], [diag4], [diag5], [diag6], [diag7], [diag8], [diag9],
+[diag10], [diag11], [diag12]
+  FROM [PiMSMarts].[dbo].[inpatients] inpatient
+  WHERE disch_dttm > '31-Dec-1999 23:59:59'
+  AND pat_dod IS NULL
+  AND main_diag IS NOT NULL"""
+#Query to pull back comorbidity icd10 codes to filter on
+icd10_query = """SELECT  [code]
+      ,[description]
+FROM [PiMSMarts].[dbo].[cset_icd10]
+WHERE LEN(code) = 4
+AND (
+(code IN ('R522', 'R521', 'J440', 'J441', 'J448', 'J449', 'E831', 'E232', 'N251', 'P702',
+          'E833', 'E748', 'E244', 'G312', 'G405', 'K852', 'K860', 'O354', 'P043', 'Q860'))
+OR (code LIKE 'I%') OR (code LIKE 'O88%') OR (code LIKE 'O10%') OR (code LIKE 'O22%')
+OR (code LIKE 'Q20%') OR (code LIKE 'Q21%') OR (code LIKE 'Q22%') OR (code LIKE 'Q23%')
+OR (code LIKE 'Q24%') OR (code LIKE 'Q25%') OR (code LIKE 'Q26%') OR (code LIKE 'P29%')
+OR (code LIKE 'E10%')  OR (code LIKE 'E11%') OR (code LIKE 'E12%') OR (code LIKE 'E13%')
+OR (code LIKE 'E14%') OR (code LIKE 'O24%') OR (code LIKE 'F10%') OR (code LIKE 'F32%')
+OR (code LIKE 'F33%') OR (code LIKE 'F40%') OR (code LIKE 'F41%') OR (code LIKE 'C%')
+OR (code LIKE 'D0%')
+)"""
 #read data
 wait_list = pd.read_sql(wl_query, sdmart_engine)
 comorb_pat = pd.read_sql(comorb_query, sdmart_engine)
+icd10_lookup = pd.read_sql(icd10_query, sdmart_engine)
 #dispose connection
 sdmart_engine.dispose()
 
 # =============================================================================
 # # Filter and tidy data
 # =============================================================================
+#convert comorb table into one long list
+comorb_pat = (comorb_pat.melt(id_vars=['patnt_refno', 'pasid'],
+             value_vars=[col for col in comorb_pat.columns if 'diag' in col]
+             ).dropna(subset='value').drop_duplicates(subset=['pasid', 'value'])
+             [['pasid', 'value']])
+#Limit to just the 4 digit level
+comorb_pat['value'] = comorb_pat['value'].str[:4]
+#filter to icd10 codes in co-morbidity list
+comorb_pat = comorb_pat.merge(icd10_lookup, left_on='value', right_on='code', how='inner')
 #create copy of longform, filter to wait list only
-comorb_pat = comorb_pat.loc[comorb_pat['pasid'].isin(wait_list['pasid'].drop_duplicates())].copy()
+comorb_pat = comorb_pat.loc[comorb_pat['pasid'].isin(wait_list['pasid'].drop_duplicates()),
+                            ['pasid', 'code', 'description']].copy()
 comorb_pat_long = comorb_pat.copy()
 #Create one row per patient
 comorb_pat['Comorb No'] = comorb_pat.groupby('pasid', as_index=False).cumcount()
 comorb_pat['Comorb No'] = 'Comorb' + comorb_pat['Comorb No'].astype(str)
-comorb_pat = comorb_pat.pivot(index='pasid', columns='Comorb No', values='comorbidity')
+comorb_pat = comorb_pat.pivot(index='pasid', columns='Comorb No', values='description')
 comorb_pat['No. Comorb'] = comorb_pat[[col for col in comorb_pat.columns if 'Comorb' in col]].count(axis=1)
 #Get the number of WL a patient is on.
 wait_list['No. WL'] = wait_list[[col for col in wait_list.columns if 'wl' in col]].count(axis=1)
 #Merge onto wait list and filter out anyone who is not on a WL
 comorb_pat = comorb_pat.merge(wait_list[['pasid', 'No. WL']], on ='pasid', how='left')
 #Create Comorbidities crosstab
-comorb_crosstab = pd.crosstab(comorb_pat_long['pasid'], comorb_pat_long['comorbidity'])
+comorb_crosstab = pd.crosstab(comorb_pat_long['pasid'], comorb_pat_long['description'])
 
 # =============================================================================
 # # Heatmap
 # =============================================================================
 #List the comorbidities for each patient and get the count of each pair
-comorb_list = comorb_pat_long.groupby('pasid')['comorbidity'].agg(list)
+comorb_list = comorb_pat_long.groupby('pasid')['description'].agg(list)
 comorb_pairs = (comorb_list.apply(lambda x:list(combinations(set(x),2)))
            .explode().value_counts().reset_index()
            .rename(columns={'index':'Comorbidity 1'}))
 #Create a df of all possible combinations
-unique_values = comorb_pat_long['comorbidity'].unique()
+unique_values = comorb_pat_long['description'].unique()
 all_combinations = list(combinations_with_replacement(unique_values, 2))
 reverse = [(combo[1], combo[0]) for combo in all_combinations]
-all_combos = pd.DataFrame({'comorbidity' : all_combinations + reverse}).drop_duplicates()
+all_combos = pd.DataFrame({'description' : all_combinations + reverse}).drop_duplicates()
 #add in missing pairs
-cat_df = comorb_pairs.merge(all_combos, on=['comorbidity'], how='right')
-cat_df['comorbidity' ] = [tuple(sorted(lst)) for lst in cat_df['comorbidity' ]]
-cat_df = cat_df.groupby('comorbidity' , as_index=False).sum()
+cat_df = comorb_pairs.merge(all_combos, on=['description'], how='right')
+cat_df['description'] = [tuple(sorted(lst)) for lst in cat_df['description']]
+cat_df = cat_df.groupby('description' , as_index=False).sum()
 #split group into two separate columns
-cat_df[['1', '2']] = cat_df['comorbidity'].tolist()
+cat_df[['1', '2']] = cat_df['description'].tolist()
 #create pivot table for heatmap
 pivot_ls = cat_df.pivot(index='1', columns='2', values='count')
-#Remove any values with less than 10 pairings
-pivot_ls[pivot_ls < 1] = np.nan
+#Remove any values with less than 1 pairings
+pivot_ls[pivot_ls < 750] = np.nan
 #Remove any empty rows/columns
 keep_cols = pivot_ls.columns[(pivot_ls.sum() > 0)]
 keep_rows = pivot_ls.index[pivot_ls.sum(axis=1) > 0]
 pivot_ls = pivot_ls.loc[keep_rows, keep_cols]
 #plot heatmap
-fig, ax = plt.subplots(figsize=(20, 10))
-labels = pivot_ls.map(lambda v: v if v else '')
-sns.heatmap(pivot_ls, cmap='Blues', robust=True, annot=True, fmt='g',
+fig, ax = plt.subplots(figsize=(40, 15))
+ax.set_facecolor('white')
+htmp = sns.heatmap(pivot_ls, cmap='Blues', robust=True, annot=True, annot_kws={'size':14}, fmt='g',
                 linewidths=0.5, linecolor='k', ax=ax)
+htmp.set_xticklabels(htmp.get_xmajorticklabels(), fontsize=16)
+htmp.set_yticklabels(htmp.get_ymajorticklabels(), fontsize=16)
 ax.set(xlabel=f'Comorb 1', ylabel=f'Comorb 2')
 plt.title(f'Comorbidity Heatmap')
 plt.savefig(f'Comorbidity Heatmap {run_date}.png', bbox_inches='tight')
@@ -233,7 +266,7 @@ plt.close()
 
 # =============================================================================
 # # Apriori algorithm
-# =============================================================================# =============================================================================
+# =============================================================================
 def patient_counts(itemsets, patients):
     no_patients = []
     for itemset in itemsets:
@@ -266,3 +299,4 @@ rules = rules.sort_values(["support", "confidence","lift"], axis=0, ascending=Fa
 writer = pd.ExcelWriter(f'Comorbidity output {run_date}.xlsx',engine='xlsxwriter')   
 frequent_itemsets.to_excel(writer, sheet_name='Frequent Itemsets', index=False)
 rules.to_excel(writer, sheet_name='Association Rules', index=False)
+writer.close()

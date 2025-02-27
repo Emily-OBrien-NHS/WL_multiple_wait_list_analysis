@@ -18,8 +18,8 @@ run_date = datetime.datetime.today().strftime('%Y-%m-%d')
 #group = 'CFS 5+'
 #group = 'Paeds'
 #group = 'Over 8 WL'
-group = 'Multi Comorb'
-#group = 'All'
+#group = 'Multi Comorb'
+group = 'All'
 
 #Settings dict contains the filter strings to filter the data to different
 #groups, and a the number of how many pairs to keep for the
@@ -202,18 +202,57 @@ WHERE list1.indx = 1
 local_spec_query = """SELECT local_spec, local_spec_desc
                       FROM PiMSMarts.dbo.cset_specialties"""
 #co-morbidity patients query
-comorb_query = """SELECT Pasid as pasid, Patnt_refno as patnt_refno, COUNT(DISTINCT(Condition_Type)) AS No_Comorbs
-FROM [InfoDB].[dbo].[co_morbidities_listing]
-GROUP BY Pasid, Patnt_refno
-having COUNT(DISTINCT(Condition_Type)) >= 2  """
+comorb_query = """SELECT patnt_refno, pasid, [main_diag],
+[diag1], [diag2], [diag3], [diag4], [diag5], [diag6], [diag7], [diag8], [diag9],
+[diag10], [diag11], [diag12]
+  FROM [PiMSMarts].[dbo].[inpatients] inpatient
+  WHERE disch_dttm > '31-Dec-1999 23:59:59'
+  AND pat_dod IS NULL
+  AND main_diag IS NOT NULL"""
+#Query to pull back comorbidity icd10 codes to filter on
+icd10_query = """SELECT  [code]
+      ,[description]
+FROM [PiMSMarts].[dbo].[cset_icd10]
+WHERE LEN(code) = 4
+AND (
+(code IN ('R522', 'R521', 'J440', 'J441', 'J448', 'J449', 'E831', 'E232', 'N251', 'P702',
+          'E833', 'E748', 'E244', 'G312', 'G405', 'K852', 'K860', 'O354', 'P043', 'Q860'))
+OR (code LIKE 'I%') OR (code LIKE 'O88%') OR (code LIKE 'O10%') OR (code LIKE 'O22%')
+OR (code LIKE 'Q20%') OR (code LIKE 'Q21%') OR (code LIKE 'Q22%') OR (code LIKE 'Q23%')
+OR (code LIKE 'Q24%') OR (code LIKE 'Q25%') OR (code LIKE 'Q26%') OR (code LIKE 'P29%')
+OR (code LIKE 'E10%')  OR (code LIKE 'E11%') OR (code LIKE 'E12%') OR (code LIKE 'E13%')
+OR (code LIKE 'E14%') OR (code LIKE 'O24%') OR (code LIKE 'F10%') OR (code LIKE 'F32%')
+OR (code LIKE 'F33%') OR (code LIKE 'F40%') OR (code LIKE 'F41%') OR (code LIKE 'C%')
+OR (code LIKE 'D0%')
+)"""
 #Pull back data
 wait_list = pd.read_sql(wl_query, sdmart_engine)
 local_spec = pd.read_sql(local_spec_query,sdmart_engine)
 comorb_pat = pd.read_sql(comorb_query, sdmart_engine)
-comorb_pat['Multi Comorb'] = 'Multi Comorb'
+icd10_lookup = pd.read_sql(icd10_query, sdmart_engine)
 #dispose connection
 sdmart_engine.dispose()
 
+# =============================================================================
+# # Comorbidity filtering
+# =============================================================================
+comorb_pat = (comorb_pat.melt(id_vars=['patnt_refno', 'pasid'],
+             value_vars=[col for col in comorb_pat.columns if 'diag' in col]
+             ).dropna(subset='value').drop_duplicates(subset=['pasid', 'value'])
+             [['pasid', 'value']])
+#Limit to just the 4 digit level
+comorb_pat['value'] = comorb_pat['value'].str[:4]
+#filter to icd10 codes in co-morbidity list
+comorb_pat = comorb_pat.merge(icd10_lookup, left_on='value', right_on='code', how='inner')
+#Group up to get the number of comorbidities per patient and filter to those
+#with 2 or more
+comorb_pat_count = comorb_pat.groupby('pasid', as_index=False)['value'].count()
+comorb_pat_count = comorb_pat_count.loc[comorb_pat_count['value'] >= 2]
+comorb_pat_count['Multi Comorb'] = 'Multi Comorb'
+
+# =============================================================================
+# # data filtering
+# =============================================================================
 #Create list of wl and ls columns to simplifty other code
 wl_cols = [col for col in wait_list.columns if 'wl' in col]
 ls_cols = [col for col in wait_list.columns if 'ls' in col]
@@ -223,7 +262,7 @@ wait_list['Age 65+'] = np.where(wait_list['Age'] >= 65, 'Age 65+', 'Age <65')
 wait_list['CFS 5+'] = np.where(wait_list['CFS'].astype(float) >= 5, 'CFS 5+', 'CFS <5')
 wait_list['Paeds'] = np.where(wait_list['Age'] < 18, 'Paeds', 'Not Paeds')
 wait_list['Over 8 WL'] = np.where(wait_list[wl_cols].count(axis=1) >= 8, 'Over 8 WL', 'Under 8 WL')
-wait_list = wait_list.merge(comorb_pat[['pasid', 'Multi Comorb']], on='pasid', how='left')
+wait_list = wait_list.merge(comorb_pat_count[['pasid', 'Multi Comorb']], on='pasid', how='left')
 
 def filter_data(filters, df):
     if len(filters) == 1:
@@ -266,7 +305,8 @@ counts_df.columns = [col + ' Count' for col in counts_df.columns]
 proportion_df.columns = [col + ' Proportion' for col in proportion_df.columns]
 counts_df = counts_df.join(proportion_df)
 
-writer = pd.ExcelWriter(f'No. Wait List Summary {run_date}.xlsx',engine='xlsxwriter')   
+summary_filepath = 'C:/Users/obriene/Projects/Wait Lists/Multiple Wait List Analysis/Outputs/Summary/'
+writer = pd.ExcelWriter(f'{summary_filepath}/No. Wait List Summary {run_date}.xlsx',engine='xlsxwriter')   
 workbook=writer.book
 worksheet=workbook.add_worksheet('Summary')
 writer.sheets['Summary'] = worksheet
@@ -352,7 +392,6 @@ def heatmap(longform, cat_df, colname, data, keep_lim):
     pivot_ls = pivot_ls.loc[keep_rows, keep_cols]
     #plot heatmap
     fig, ax = plt.subplots(figsize=(20, 10))
-    labels = pivot_ls.map(lambda v: v if v else '')
     sns.heatmap(pivot_ls, cmap='Blues', robust=True, annot=True, fmt='g',
                 linewidths=0.5, linecolor='k', ax=ax)
     ax.set(xlabel=f'{data} 1', ylabel=f'{data} 2')
